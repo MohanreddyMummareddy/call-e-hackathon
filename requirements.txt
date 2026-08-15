@@ -1,4 +1,4 @@
-call-e-sdk
+calle-ai
 flask
 google-auth
 google-auth-oauthlib
