@@ -607,6 +607,17 @@ def get_google_credentials():
             creds = Credentials.from_authorized_user_file(CREDENTIALS_FILE)
         except Exception:
             return None
+    elif os.environ.get("GOOGLE_TOKEN_JSON"):
+        # Render free instances have ephemeral disk: restore the token from an
+        # env var so restarts keep the connection (refresh token stays valid).
+        try:
+            creds = Credentials.from_authorized_user_info(
+                json.loads(os.environ["GOOGLE_TOKEN_JSON"])
+            )
+            save_credentials(creds)
+        except Exception as e:
+            print(f"GOOGLE_TOKEN_JSON restore failed: {e}")
+            return None
     
     # If no (valid) credentials, let the user log in
     if not creds or not creds.valid:
