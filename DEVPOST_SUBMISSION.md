@@ -19,9 +19,9 @@
 **Suggested Text** (copy this exactly):
 
 >
-> "Customer Follow-Up Automation solves the critical problem of lead decay - 50% of leads are lost when follow-up exceeds 30 minutes. Our hybrid solution uses CALL-E Python SDK for outbound voice calls integrated with Google Calendar API for automatic appointment scheduling.
+> "Customer Follow-Up Automation solves the critical problem of lead decay - 50% of leads are lost when follow-up exceeds 30 minutes. Our hybrid solution uses CALL-E Python SDK for outbound AI voice calls integrated with Google Calendar API and Gmail API for automatic appointment scheduling.
 >
-> When a lead submits a website form, our system triggers a CALL-E outbound call within 5 minutes. The call plays a personalized message and offers a calendar booking option. Pressing 1 triggers Google Calendar API to create an appointment slot, then sends confirmation via email.
+> When a lead is submitted, our system triggers a CALL-E outbound call immediately. The AI agent auto-detects the lead's timezone from their phone number, reads the company's live calendar availability (30-minute slots, 10 AM-6 PM), and only offers free slots - informing the lead when a requested time is already booked and presenting alternatives. Once the lead confirms the slot and timezone, Google Calendar creates the appointment and Gmail sends the confirmation email.
 >
 > This end-to-end automation helps businesses convert 3x more leads by ensuring immediate, personalized follow-up. Built with Python, uses CALL-E SDK for real runtime voice integration, and demonstrates full-stack skills connecting voice to scheduling software.
 >
@@ -160,29 +160,37 @@ Python, Flask, CALL-E SDK, Google Cloud, Google Calendar API, OAuth 2.0, JSON, H
 **Suggested Text** (very similar to description above, possibly slightly different format):
 
 >
-> "Customer Follow-Up Automation - Hybrid: CALL-E Python SDK + Google Calendar API
+> "Customer Follow-Up Automation - Hybrid: CALL-E Python SDK + Google Calendar API + Gmail API
 >
 > Problem: 50% of leads lost when follow-up exceeds 30 minutes
 > 
-> Solution: Outbound CALL-E calls within 5 minutes of lead submission, with calendar scheduling via DTMF input (press 1)
+> Solution: Outbound CALL-E AI calls immediately after lead submission, booking appointments from the company's real calendar availability
 > 
 > Features:
-> - Automated outbound calls using CALL-E Python SDK
+> - Automated outbound AI voice calls using CALL-E Python SDK
 > - Personalized messaging with name recognition
-> - DTMF input handling (press 1 to schedule)
+> - Timezone auto-detection from the lead's phone number (phonenumbers)
+> - Live calendar availability: 30-minute slots, 10 AM-6 PM, only free slots offered
+> - Agent informs the lead when a requested time is booked and offers alternatives
+> - Timezone confirmation in the call before booking (no wrong-time bookings)
 > - Google Calendar API integration for automatic appointment booking
-> - Email confirmation sent after scheduling
+> - Gmail API confirmation email with calendar link sent after scheduling
+> - Bulk lead upload from Excel/CSV with per-row status tracking
+> - Automatic conflict resolution (re-checks slot before insert)
 > - Full-stack Python implementation
 > 
 > Technical Details:
 > - CALL-E SDK imported and called at runtime (not just referenced)
-> - Google Calendar OAuth 2.0 for authorization
+> - Google OAuth 2.0 (consent flow) for Calendar + Gmail authorization
 > - Flask web server for lead submission webhook
+> - IANA timezone conversion engine (lead timezone -> company timezone)
 > - Real-time API calls during phone call flow
+> - Background worker for sequential batch processing
 > 
 > Business Value:
 > - 3x more leads converted through timely follow-up
-> - Automates 30-minute manual process to 5-minute automated
+> - Automates 30-minute manual process to immediate automated follow-up
+> - Zero double-bookings through live availability + conflict checks
 > - Helps small businesses capture more leads without additional staff
 > 
 > Future Enhancements:
@@ -256,22 +264,19 @@ Based on rules, prizes available but specifics not detailed. Typically:
 > **Testing Instructions for Judges:**
 > 
 > 1. **Visit deployed app**: https://yourusername.pythonanywhere.com
-> 2. **Submit test lead**: POST to `/lead-submission` with JSON:
->    ```json
->    { "name": "Test User", "email": "test@example.com", "phone": "+1234567890", "company": "Test Corp" }
->    ```
-> 3. **CALL-E call**: System will place outbound call within 5 minutes
-> 4. **Press 1**: Triggers Google Calendar event creation
-> 5. **Confirmation**: Check email for appointment confirmation
+> 2. **Connect Google Calendar**: click "Connect Google Calendar" and complete OAuth (Calendar + Gmail scopes)
+> 3. **Submit test lead**: enter name, phone (country code + number), email; the lead's timezone is auto-detected below the phone field
+> 4. **CALL-E call**: system places the outbound call; the AI agent offers available 30-minute slots (10 AM-6 PM) in the lead's timezone and confirms the day/time/timezone
+> 5. **Scheduling**: on confirmation, the event appears on the company's Google Calendar
+> 6. **Confirmation**: the lead receives a Gmail confirmation with the event link
 > 
 > **Credentials (if needed)**:
-> - Google OAuth: Completed via `oauth2callback` endpoint
+> - Google OAuth: Completed via the "Connect Google Calendar" button
 > - No login required for public testing
 > 
 > **Testing Notes**:
 > - Free tier may sleep after inactivity (first request may be slow)
-> - Google Calendar requires OAuth completion (run `python app.py oauth` first)
-> - CALL-E SDK works with API key: `[Hidden for security]`
+> - CALL-E calls consume the account's free call credits
 > - Project free of charge, no restrictions for judging period
 > 
 > **Judging Period**: October 1-13, 2026

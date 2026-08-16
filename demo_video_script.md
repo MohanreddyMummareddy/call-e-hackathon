@@ -10,11 +10,12 @@
 
 OVERLAY_TEXT: "PROBLEM: 50% of leads lost when follow-up exceeds 30 minutes"
 
-SCREEN: Web form with fields: Name, Email, Phone, Company
-User fills: "Acme Corp" → "John Doe" → "+1234567890" → "john@example.com"
-User clicks "Submit Lead"
+SCREEN: Web form with fields: Name, Phone (country code + number), Email, Company
+User fills: "John Doe" → "+91" + "7842176703" → "john@example.com" → "XYZ Inc"
+Timezone auto-detects below phone: "Detected timezone: IST (India Standard Time)"
+User clicks "Place CALL-E Follow-up Call"
 
-OVERLAY_TEXT: "SOLUTION: Immediate CALL-E follow-up within 5 minutes"
+OVERLAY_TEXT: "SOLUTION: Immediate CALL-E follow-up with timezone-aware booking"
 
 ---
 # SCENE 2: CALL-E Outbound Call Initiates
@@ -22,44 +23,46 @@ OVERLAY_TEXT: "SOLUTION: Immediate CALL-E follow-up within 5 minutes"
 # Visual: Phone screen animation, CALL-E SDK call being placed
 # Audio: Subtle phone ringing sound (optional), on-screen text
 
-SCREEN: Phone interface showing incoming call from "+1234567890"
-CALL-E SDK LOG: "Outbound call placed to +1234567890"
+SCREEN: Phone interface showing incoming call from "+917842176703"
+CALL-E SDK LOG: "Outbound call placed to +917842176703"
 Call status: "Queued" → "Connecting" → "Active"
 
-OVERLAY_TEXT: "CALL-E SDK places outbound call within 5 minutes"
+OVERLAY_TEXT: "CALL-E SDK places outbound call immediately"
 
 AUDIO: (Optional) Phone ringing sound effect
 ON-SCREEN: "Call connected in 4 seconds"
 
 ---
-# SCENE 3: Personalized Message Plays
+# SCENE 3: AI Agent Offers Available Slots
 # Duration: 0:45 - 1:10
-# Visual: Call screen with transcript of message playing
+# Visual: Call screen with transcript of agent conversation
 # Audio: TEXT-TO-SPEECH of the call message
 
 TRANSCRIPT APPEARS on screen:
 "Hello John, this is a follow-up call from Acme Corp.
 We noticed your interest and wanted to connect.
-Press 1 to schedule a quick 15-minute appointment on our calendar.
-Press 2 for more information.
-Press 9 to be removed from calls."
+Would you like to schedule a quick 30-minute appointment?
+The available slots tomorrow (IST - India Standard Time) are:
+10:00, 10:30, 11:00 ... 17:30."
 
-ON-SCREEN TIMER: "0:45 - Message playing"
+ON-SCREEN TIMER: "0:45 - Agent offering live calendar availability"
 
-OVERLAY_TEXT: "Personalized message addresses lead by name"
+OVERLAY_TEXT: "Agent only offers free slots from the company calendar"
 
 ---
-# SCENE 4: User Presses 1 to Schedule
+# SCENE 4: Lead Picks Slot, Agent Confirms Timezone
 # Duration: 1:10 - 1:35
-# Visual: Call interface with DTMF input visualization
-# Audio: DTMF tone sound
+# Visual: Conversation transcript continues
+# Audio: TEXT-TO-SPEECH
 
-VISUAL: DTMF digits appearing: "1"
-AUDIO: DTMF tone: "Beep..."
+TRANSCRIPT:
+"LEAD: 10 AM tomorrow works for me.
+AGENT: To confirm - you'd like 10:00 AM tomorrow in IST (India Standard Time). Is that right?
+LEAD: Yes, that's correct."
 
-ON-SCREEN: "Press 1 → Scheduling Google Calendar appointment..."
+ON-SCREEN: "time_confirmed: yes | timezone: Asia/Kolkata"
 
-OVERLAY_TEXT: "User presses 1 to book appointment"
+OVERLAY_TEXT: "Slot + timezone confirmed before booking"
 
 ---
 # SCENE 5: Google Calendar Event Created
@@ -71,8 +74,8 @@ SCREEN: Google Calendar showing new event created
 EVENT DETAILS:
 - Title: "Follow-up: John Doe - Acme Corp"
 - Description: "Scheduled follow-up call... Lead interest captured via CALL-E automation"
-- Time: "Tomorrow 9:00 AM - 9:30 AM"
-- Attendee: "john@example.confirmed"
+- Time: "Tomorrow 10:00 AM - 10:30 AM (IST)"
+- Attendee: "john@example.com"
 
 ON-SCREEN CONFIRMATION: "Appointment scheduled successfully!"
 
@@ -85,8 +88,8 @@ OVERLAY_TEXT: "Google Calendar event created automatically"
 # Audio: None (on-screen text)
 
 SCREEN: Email inbox showing confirmation email
-SUBJECT: "Your Follow-up Appointment is Scheduled"
-PREVIEW: "Hi John, your 15-minute appointment is scheduled for tomorrow at 9:00 AM..."
+SUBJECT: "Appointment Confirmed: Follow-up with Acme Corp"
+PREVIEW: "Hi John, your 30-minute appointment is scheduled for tomorrow at 10:00 AM (IST)..."
 
 OVERLAY_TEXT: "Confirmation email sent with appointment details"
 
@@ -136,10 +139,10 @@ OVERLAY TEXT (final): "CALL-E: Your Code Is Calling - Hackathon Submission"
 5. **Footage must show project functioning**: All 6 scenes above must be actual recording
 
 ## Scene Checklist for Judges:
-- [ ] Lead form submission (Scene 1)
+- [ ] Lead form with auto-detected timezone (Scene 1)
 - [ ] CALL-E SDK call placed (Scene 2)
-- [ ] Personalized message plays (Scene 3)
-- [ ] DTMF "1" pressed for scheduling (Scene 4)
+- [ ] Agent offers available slots (Scene 3)
+- [ ] Lead picks slot, agent confirms timezone (Scene 4)
 - [ ] Google Calendar event created (Scene 5)
 - [ ] Confirmation sent (Scene 6)
 - [ ] All 4 judging criteria referenced (Scene 7)
@@ -174,11 +177,11 @@ OVERLAY TEXT (final): "CALL-E: Your Code Is Calling - Hackathon Submission"
 
 (0:15) Using the CALL-E Python SDK, we place an outbound call to the lead.
 
-(0:22) The call plays a personalized message: 'Hello John, this is a follow-up call from Acme Corp. Press 1 to schedule a quick 15-minute appointment.'
+"(0:22) The call plays a personalized message: 'Hello John, this is a follow-up call from Acme Corp. Would you like to schedule a 30-minute appointment? The available slots tomorrow in IST (India Standard Time) are 10:00, 10:30, 11:00...'
 
-(0:32) The lead presses 1 on their phone.
+(0:32) The lead picks 10 AM tomorrow, and the agent confirms: '10:00 AM tomorrow in IST, is that right?'
 
-(0:38) This triggers our Google Calendar API integration, which creates a calendar event automatically.
+(0:38) On confirmation, our Google Calendar API integration creates the event automatically.
 
 (0:46) A confirmation email is sent with the appointment details.
 

@@ -96,7 +96,7 @@ Add your integration to the repository README:
 ### Customer Follow-Up Automation
 - **Integrator**: Your Name (your-email@example.com)
 - **Description**: CALL-E Python SDK + Google Calendar API for automated lead follow-up
-- **Features**: Outbound calls, DTMF scheduling, auto-calendar booking
+- **Features**: Outbound AI calls, timezone-aware slot offers, auto-calendar booking
 - **Demo**: https://youtube.com/watch your demo video
 - **CALL-E Account**: your-email@example.com
 ```
@@ -134,11 +134,8 @@ git commit -m "hackathon-2026: Add Google Calendar follow-up integration
 
 - CALL-E Python SDK integration
 - Google Calendar API for appointment scheduling
-- DTMF input handling (press 1 to schedule)
+- Timezone-aware slot offers from live calendar availability
 - Designed for CALL-E: Your Code Is Calling hackathon"
-
-# Push to your fork
-git push origin hackathon-2026-your-name
 ```
 
 ---
@@ -167,21 +164,21 @@ Includes Python SDK usage and third-party API integration.
 
 ## How It Works
 1. User receives CALL-E outbound call
-2. Personalized message plays with scheduling option
-3. User presses 1 on keypad
+2. AI agent offers available 30-min slots in the lead's timezone
+3. Lead confirms the slot and timezone verbally
 4. Google Calendar event is created automatically
-5. Confirmation sent to lead
+5. Gmail confirmation sent to lead
 
 ## Technical Details
 - **CALL-E SDK**: Used for outbound call functionality
-- **Third-Party API**: Google Calendar API (OAuth 2.0)
+- **Third-Party API**: Google Calendar API + Gmail API (OAuth 2.0)
 - **Integration Type**: Agent skill for workflow automation
 - **Setup Requirements**: Google Cloud credentials needed
 
 ## Testing
-- Tested with mock CALL-E call data
+- Tested with real CALL-E outbound calls
 - Google OAuth flow verified (setup instructions included)
-- End-to-end flow: call → DTMF → calendar event → confirmation
+- End-to-end flow: call → slot offer → timezone confirmation → calendar event → email
 
 ## Screenshots/Videos
 - Demo video: https://youtube.com/watch?v YOUR_VIDEO_ID
