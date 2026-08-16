@@ -55,6 +55,9 @@ GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", GOOGLE_OAUTH_CONFIG[
 # Session-based credential storage (for demo; production use DB or session store)
 CREDENTIALS_FILE = "user_token.json"
 
+# When present, suppress GOOGLE_TOKEN_JSON restore so Disconnect sticks
+DISCONNECT_FLAG = "oauth_disconnected.flag"
+
 # In-memory pending lead store keyed by call SID (single-process demo)
 pending_leads = {}
 
@@ -607,9 +610,10 @@ def get_google_credentials():
             creds = Credentials.from_authorized_user_file(CREDENTIALS_FILE)
         except Exception:
             return None
-    elif os.environ.get("GOOGLE_TOKEN_JSON"):
+    elif os.environ.get("GOOGLE_TOKEN_JSON") and not os.path.exists(DISCONNECT_FLAG):
         # Render free instances have ephemeral disk: restore the token from an
         # env var so restarts keep the connection (refresh token stays valid).
+        # A Disconnect click drops the flag file so the user stays disconnected.
         try:
             creds = Credentials.from_authorized_user_info(
                 json.loads(os.environ["GOOGLE_TOKEN_JSON"])
@@ -1724,6 +1728,8 @@ def oauth2callback():
         
         # Save credentials
         save_credentials(creds)
+        if os.path.exists(DISCONNECT_FLAG):
+            os.remove(DISCONNECT_FLAG)
         
         # Send the user back to the main page, which now reflects the connected state
         return redirect("/?oauth=connected")
@@ -1776,6 +1782,8 @@ def oauth_disconnect():
     try:
         if os.path.exists(CREDENTIALS_FILE):
             os.remove(CREDENTIALS_FILE)
+        with open(DISCONNECT_FLAG, "w") as f:
+            f.write("disconnected")
         return jsonify({"status": "success", "connected": False})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
