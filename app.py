@@ -1,7 +1,8 @@
-"""CALL-E Hackathon: Customer Follow-Up Automation Hybrid Project
+"""CALL-E Hackathon: Customer Follow-Up Automation
 
 Python SDK + Google Calendar API integration for automated lead follow-up calls.
-Production-ready with proper OAuth flow and demo mode.
+Reference demo: preview mode is fully simulated; live mode requires explicit
+operator opt-in and per-call confirmation. See README for operational notes.
 """
 
 import os
@@ -90,7 +91,15 @@ batch_jobs = {}
 # ============================================================
 
 def require_token():
-    """Fail closed on every protected route: a valid Bearer APP_TOKEN is mandatory."""
+    """Fail closed on every protected route: a valid Bearer APP_TOKEN is mandatory.
+
+    Exception: when live calls are disabled AND the operator has not set
+    APP_TOKEN, the app runs as a credential-free preview. Nothing can be
+    dialed, booked, or persisted in that mode, so the routes are opened to
+    make the documented preview runnable without any credentials.
+    """
+    if not LIVE_CALLS_ENABLED and not APP_TOKEN:
+        return None
     auth = request.headers.get("Authorization", "")
     expected = "Bearer " + APP_TOKEN
     if not APP_TOKEN or auth != expected:
@@ -202,7 +211,7 @@ DEMO_HTML = """
                     <label>Lead's Phone Number</label>
                     <div style="display:flex; gap:8px;">
                         <select id="phone-country" style="width:38%; padding:10px 12px; border:2px solid #e2e8f0; border-radius:8px; font-size:15px; background:#fff;"></select>
-                        <input type="text" id="phone" placeholder="9876543210" value="7842176703" style="flex:1; min-width:0; padding:10px 12px; border:2px solid #e2e8f0; border-radius:8px; font-size:15px;">
+                        <input type="text" id="phone" placeholder="55550100" style="flex:1; min-width:0; padding:10px 12px; border:2px solid #e2e8f0; border-radius:8px; font-size:15px;">
                     </div>
                     <div id="lead-tz-display" style="font-size:13px; color:#4a5568; margin-top:6px; min-height:18px;">Detected timezone: checking...</div>
                     <input type="hidden" id="company-tz" value="UTC">
@@ -213,6 +222,7 @@ DEMO_HTML = """
                     <label>API Token (required)</label>
                     <input type="password" id="api-token" placeholder="APP_TOKEN set by the operator" autocomplete="off">
                     <label><input type="checkbox" id="live-confirm" style="width:auto; margin-right:6px;">I understand live calls are enabled server-side and this places a real phone call</label>
+                    <label><input type="checkbox" id="lead-consent" style="width:auto; margin-right:6px;" checked>The lead requested this follow-up and consents to being called at this number</label>
                     <button class="btn btn-green" id="btn-call" onclick="submitLead()" disabled>Place CALL-E Follow-up Call</button>
                     <div class="status" id="call-status"></div>
                     <div class="result-box" id="call-result"></div>
@@ -220,7 +230,7 @@ DEMO_HTML = """
 
                 <div id="bulk-mode" style="display:none;">
                     <p style="font-size:14px; color:#4a5568;">
-                        Upload an Excel/CSV file with columns: <strong>name, phone, email, company, your_company</strong> (first row = headers, <strong>company_tz</strong> optional).
+                        Upload an Excel/CSV file with columns: <strong>name, phone, email, company, your_company</strong> (first row = headers, <strong>company_tz</strong> and <strong>consent</strong> optional; set consent=yes for every recipient you are authorized to call).
                         Calls happen sequentially. After processing, download the file with a <strong>status</strong> column added.
                         Re-uploading the same file only calls leads that were <strong>not</strong> successfully scheduled.
                     </p>
@@ -294,7 +304,8 @@ DEMO_HTML = """
                 email: document.getElementById('email').value,
                 company: document.getElementById('company').value,
                 your_company: document.getElementById('your-company').value,
-                company_tz: document.getElementById('company-tz').value
+                company_tz: document.getElementById('company-tz').value,
+                consent: document.getElementById('lead-consent').checked ? 'yes' : 'no'
             };
             const statusBox = document.getElementById('call-status');
             const resultBox = document.getElementById('call-result');
@@ -1114,22 +1125,31 @@ def schedule_google_calendar(name, email, phone, company, your_company=None, pre
                     tz_note = f"({preferred_time} {company_tz})"
 
         if start_time is None:
-            # Fallback default slot
-            start_time = datetime.combine(base_day, datetime.strptime("09:00", "%H:%M").time()).replace(tzinfo=ZoneInfo(company_tz))
+            return {
+                "status": "error",
+                "message": "No valid confirmed time available - nothing was booked.",
+            }
 
         # Re-check the chosen slot is still free (another lead/meeting may have
-        # taken it since the call); if so, move to the first free slot.
-        adjusted = False
+        # taken it since the call). Fail closed: if the lookup fails, or the
+        # confirmed slot is no longer free, refuse to book. Never silently move
+        # to a different time the lead did not confirm.
         try:
             busy = get_calendar_busy(service, start_time.date(), company_tz)
-            if any(s < start_time + timedelta(minutes=SLOT_MINUTES) and e > start_time for s, e in busy):
-                free = get_available_slots(service, start_time.date(), company_tz, lead_tz)
-                if free:
-                    start_time = free[0]["start"]
-                    tz_note = f"(requested time was booked; moved to first free slot {start_time.strftime('%H:%M')} {company_tz})"
-                    adjusted = True
         except Exception as e:
             print(f"Conflict check failed: {e}")
+            return {
+                "status": "error",
+                "message": f"Availability lookup failed ({e}); the appointment was NOT booked. Retry or book manually.",
+            }
+        if any(s < start_time + timedelta(minutes=SLOT_MINUTES) and e > start_time for s, e in busy):
+            return {
+                "status": "error",
+                "message": (
+                    f"The confirmed slot ({start_time.strftime('%H:%M')} {company_tz}) is no longer free; "
+                    "the appointment was NOT booked at a different time. Offer the free slots and re-confirm with the lead."
+                ),
+            }
 
         end_time = start_time + timedelta(minutes=SLOT_MINUTES)  # 30-min appointment
         
@@ -1142,7 +1162,7 @@ def schedule_google_calendar(name, email, phone, company, your_company=None, pre
                 f"Scheduled follow-up call with {name} from {lead_org}.\n"
                 f"Caller: {caller}\n"
                 f"Lead interest captured via CALL-E automation.\n"
-                f"Phone: {phone}\n"
+                f"Phone: {mask_phone(phone)}\n"
                 f"Lead email: {email}\n"
                 f"Call SID: {call_sid or 'n/a'}\n"
                 f"Time: {start_time.isoformat()} {tz_note}"
@@ -1170,7 +1190,6 @@ def schedule_google_calendar(name, email, phone, company, your_company=None, pre
             "preferred_time": preferred_time,
             "timezone": company_tz,
             "tz_note": tz_note,
-            "adjusted": adjusted,
         }
         
     except Exception as e:
@@ -1290,9 +1309,11 @@ Wait for their verbal confirmation before recording the time."""
         slots_line = f"""
 The available appointment slots for {slot_day}{tz_clause} are: {slot_times}.
 IMPORTANT: Only offer times from this list. If the lead requests a time that is not in the list, tell them that time is already booked, and offer the available slots instead. Confirm the chosen slot with them before recording it."""
-    return f"""Call the lead {name}.{context}
-Say: Hello {name}, this is a follow-up call from {your_company}. We noticed your interest and wanted to connect. 
-Then ask if they would like to schedule a quick 30-minute appointment on our calendar. 
+    return f"""Call the lead {name} on behalf of {your_company}.{context}
+AI DISCLOSURE (mandatory, first): Begin the call by clearly stating:
+'Hello {name}, this is {your_company}'s AI voice assistant returning your follow-up request. I am an AI and this call is automated.'
+If the lead is surprised, objects to speaking with an AI, or asks to end the call, apologize, end the call politely, and record wants_appointment=no - do not continue.
+Then, if they are willing to continue, ask if they would like to schedule a quick 30-minute appointment on our calendar. 
 If they accept, ask which day (today or tomorrow) and what time works best for them in their local timezone.{slots_line}
 After they give a time, repeat it back and ask them to confirm the day, time, and that it is in their local timezone.
 Record the result only after the lead confirms the time.{tz_line}"""
@@ -1411,19 +1432,30 @@ def lead_submission():
         company_tz = lead_data.get("company_tz", "UTC") or "UTC"  # caller's timezone
         lead_tz = get_lead_timezone(phone)  # derived from phone number
 
-        # Gate: require Google (Calendar + Gmail) connection before placing calls
-        creds = get_google_credentials()
-        has_gmail = any(
-            "gmail.send" in s for s in (getattr(creds, "scopes", None) or [])
-        )
-        has_calendar = any(
-            "calendar" in s for s in (getattr(creds, "scopes", None) or [])
-        )
-        if not creds or not has_gmail or not has_calendar:
+        # Contact authorization: live calls are only placed for leads whose
+        # consent is recorded in the request (and stamped server-side).
+        consent = (lead_data.get("consent") or "").strip().lower()
+        if LIVE_CALLS_ENABLED and consent != "yes":
             return jsonify({
-                "error": "Google Calendar & Gmail are not connected. Visit /oauth to authorize, then retry.",
-                "status": "oauth_required",
-            }), 403
+                "error": "Live calls require recorded lead consent: set consent=yes (the lead must have authorized this follow-up call).",
+            }), 400
+
+        # Preview mode (live disabled) needs no Google connection: the result
+        # is simulated and nothing is dialed or booked.
+        creds = None
+        if LIVE_CALLS_ENABLED:
+            creds = get_google_credentials()
+            has_gmail = any(
+                "gmail.send" in s for s in (getattr(creds, "scopes", None) or [])
+            )
+            has_calendar = any(
+                "calendar" in s for s in (getattr(creds, "scopes", None) or [])
+            )
+            if not creds or not has_gmail or not has_calendar:
+                return jsonify({
+                    "error": "Google Calendar & Gmail are not connected. Visit /oauth to authorize, then retry.",
+                    "status": "oauth_required",
+                }), 403
 
         # Pre-compute tomorrow's free 30-min slots (10 AM-6 PM) so the agent
         # can offer only available times and handle "that time is taken".
@@ -1458,6 +1490,8 @@ def lead_submission():
                 "lead_tz": lead_tz,
                 "session_id": current_session_id(),
                 "simulated": bool(call_result.get("simulated")),
+                "consent": consent,
+                "consent_recorded_at": datetime.utcnow().isoformat() + "Z",
             }
 
         # Combine results
@@ -1522,6 +1556,19 @@ def call_status(call_id):
         auth_err = require_token()
         if auth_err:
             return auth_err
+
+        # Preview mode has no real SID: return an honest simulated result.
+        if not call_id or call_id in ("null", "undefined"):
+            return jsonify({
+                "call_id": call_id,
+                "status": "simulated",
+                "summary": "Preview mode: no real call was placed.",
+                "structured_result": {},
+                "calendar": {
+                    "status": "simulated",
+                    "message": "Nothing was booked in preview mode.",
+                },
+            })
 
         lead = pending_leads.get(call_id, {})
 
@@ -1602,7 +1649,7 @@ def call_status(call_id):
 # BATCH UPLOAD (Excel/CSV) - sequential calls + status tracking
 # ============================================================
 
-BATCH_HEADERS = ["name", "phone", "email", "company", "your_company", "company_tz"]
+BATCH_HEADERS = ["name", "phone", "email", "company", "your_company", "company_tz", "consent"]
 BATCH_ALIASES = {
     "name": ["name", "lead name", "full name", "lead name"],
     "phone": ["phone", "phone number", "mobile", "phone no", "phonenumber"],
@@ -1682,6 +1729,16 @@ def read_batch_rows(file_storage):
             continue
         row["phone"] = e164
         row["lead_tz"] = get_lead_timezone(row["phone"])
+        row["consent"] = (row.get("consent") or "").strip().lower()
+
+        # Live calls require recorded consent per recipient.
+        if LIVE_CALLS_ENABLED and row["consent"] != "yes":
+            row["status"] = "error"
+            row["error"] = "Consent required: set consent=yes to authorize a live call for this recipient."
+            row["_invalid"] = True
+            rows.append(row)
+            continue
+        row["consent_recorded_at"] = datetime.utcnow().isoformat() + "Z"
 
         # Skip rows already successfully scheduled in a previous run
         if status_col is not None and status_col < len(line) and line[status_col]:
@@ -1755,6 +1812,8 @@ def process_batch(batch_id):
                     if call_e_client.using_real_sdk:
                         raw = call_e_client._impl.calls.get(row["call_sid"])
                         status = raw.get("status")
+                        if not status:
+                            raise ValueError("provider returned no status")
                         structured = raw.get("structured_result") or {}
                     else:
                         status = "simulated"
@@ -1766,12 +1825,18 @@ def process_batch(batch_id):
                         break
                 except Exception as e:
                     row["status"] = "error"
-                    row["error"] = str(e)
+                    row["error"] = f"Call status lookup failed: {e}"
                     terminal = True
                     break
 
             if job.get("stop"):
                 row["status"] = "stopped"
+            elif terminal and row.get("status") == "error":
+                # A status-fetch failure was recorded; nothing further happens.
+                pass
+            elif not terminal:
+                row["status"] = "error"
+                row["error"] = "Call status unknown (polling timed out); no booking attempted."
             elif terminal and status == "completed":
                 decision = booking_decision(status, structured, simulated=bool(row.get("simulated")))
                 if decision is not None:
@@ -1838,9 +1903,10 @@ def batch_upload():
                              "'X-Confirm-Live-Call: I understand this places a real phone call'.",
                 }), 403
 
-        creds = get_google_credentials()
-        if not creds:
-            return jsonify({"error": "Google not connected. Visit /oauth first."}), 403
+        if LIVE_CALLS_ENABLED:
+            creds = get_google_credentials()
+            if not creds:
+                return jsonify({"error": "Google not connected. Visit /oauth first."}), 403
 
         file = request.files.get("file")
         if not file or not file.filename:
@@ -1903,6 +1969,8 @@ def batch_status(batch_id):
                 "your_company": r["your_company"],
                 "company_tz": r.get("company_tz") or "UTC",
                 "lead_tz": r.get("lead_tz"),
+                "consent": r.get("consent", ""),
+                "consent_recorded_at": r.get("consent_recorded_at"),
                 "status": r.get("status", "pending"),
                 "call_sid": r.get("call_sid"),
                 "appointment": r.get("appointment"),
@@ -1947,13 +2015,14 @@ def batch_download(batch_id):
     wb = Workbook()
     ws = wb.active
     ws.title = "Leads"
-    headers = BATCH_HEADERS + ["status", "appointment", "call_sid", "event_id", "calendar_link", "error"]
+    headers = BATCH_HEADERS + ["consent_recorded_at", "status", "appointment", "call_sid", "event_id", "calendar_link", "error"]
     ws.append(headers)
 
     for r in job["rows"]:
         ws.append([
             r.get("name", ""), mask_phone(r.get("phone", "")), r.get("email", ""),
             r.get("company", ""), r.get("your_company", ""), r.get("company_tz", ""),
+            r.get("consent", ""), r.get("consent_recorded_at", ""),
             r.get("status", "pending"), r.get("appointment", ""),
             r.get("call_sid", ""), r.get("event_id", ""),
             r.get("htmlLink", ""), r.get("error", ""),
@@ -2165,6 +2234,16 @@ if __name__ == "__main__":
     print("CALL-E Hackathon: Customer Follow-Up Automation")
     print("Hybrid: Python SDK + Google Calendar API")
     print("=" * 60)
+    if not LIVE_CALLS_ENABLED:
+        print("PREVIEW MODE: live calls are DISABLED (CALLE_LIVE_CALLS_ENABLED unset).")
+        print("All call results are simulated; nothing is dialed or booked.")
+        if not APP_TOKEN:
+            print("No APP_TOKEN configured: routes run unauthenticated because no live side effect is possible.")
+        else:
+            print("APP_TOKEN is configured and enforced on all private routes.")
+    else:
+        print("LIVE MODE: CALLE_LIVE_CALLS_ENABLED=true. Real calls can be placed.")
+        print("Every live request requires the X-Confirm-Live-Call header and a Bearer APP_TOKEN.")
     print(f"Server starting at http://localhost:{port}")
     print("Endpoints:")
     print("  GET  /          - Demo information page")
