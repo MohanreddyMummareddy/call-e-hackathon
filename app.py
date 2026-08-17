@@ -29,8 +29,28 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", "dev-secret-key-for-hackathon")
 
 # CONFIGURATION
-CALL_E_API_KEY = os.environ.get("CALL_E_API_KEY", "your-api-key-here")
+# No placeholder: an empty/missing key must fail closed (never look configured).
+CALL_E_API_KEY = os.environ.get("CALL_E_API_KEY", "")
+if CALL_E_API_KEY in ("your-api-key-here", "YOUR_API_KEY_HERE"):
+    CALL_E_API_KEY = ""
 call_e_client = CALL_EClient(api_key=CALL_E_API_KEY)
+
+# Explicit server-side live enable. Credential presence alone never selects
+# live behavior: calls are placed only when CALLE_LIVE_CALLS_ENABLED is true.
+LIVE_CALLS_ENABLED = os.environ.get("CALLE_LIVE_CALLS_ENABLED", "").strip().lower() in ("1", "true", "yes")
+
+# Bearer token required by every state-changing/private route. The demo UI
+# collects it once and sends it as "Authorization: Bearer <token>".
+APP_TOKEN = os.environ.get("APP_TOKEN", "").strip()
+if LIVE_CALLS_ENABLED and (len(APP_TOKEN) < 16 or any(ch.isspace() for ch in APP_TOKEN)):
+    raise RuntimeError(
+        "CALLE_LIVE_CALLS_ENABLED requires APP_TOKEN: a whitespace-free secret of at least 16 characters."
+    )
+
+# Explicit operator opt-in for persisting the OAuth token to disk / restoring
+# from GOOGLE_TOKEN_JSON. Without this, tokens live only in server memory
+# keyed by the session that authorized them.
+PERSIST_TOKEN = os.environ.get("PERSIST_GOOGLE_TOKEN", "").strip().lower() in ("1", "true", "yes")
 
 # Google Calendar Setup - OAuth 2.0
 GOOGLE_SCOPES = [
@@ -45,15 +65,16 @@ GOOGLE_OAUTH_CONFIG = {
         "token_uri": "https://oauth2.googleapis.com/token",
         "redirect_uris": [
             os.environ.get("GOOGLE_REDIRECT_URI_LOCAL", "http://localhost:8080/oauth2callback"),
-            "https://mohanreddymumma.pythonanywhere.com/oauth2callback",
         ],
     }
 }
 # Choose which registered redirect URI the OAuth flow uses (local first, prod override)
 GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", GOOGLE_OAUTH_CONFIG["web"]["redirect_uris"][0])
 
-# Session-based credential storage (for demo; production use DB or session store)
+# Server-side OAuth token store keyed by the session that authorized it.
+# Persistence to disk happens only when PERSIST_GOOGLE_TOKEN=true (operator opt-in).
 CREDENTIALS_FILE = "user_token.json"
+oauth_tokens = {}
 
 # When present, suppress GOOGLE_TOKEN_JSON restore so Disconnect sticks
 DISCONNECT_FLAG = "oauth_disconnected.flag"
@@ -63,6 +84,59 @@ pending_leads = {}
 
 # Batch upload jobs keyed by batch id
 batch_jobs = {}
+
+# ============================================================
+# AUTH / PRIVACY HELPERS
+# ============================================================
+
+def require_token():
+    """Fail closed on every protected route: a valid Bearer APP_TOKEN is mandatory."""
+    auth = request.headers.get("Authorization", "")
+    expected = "Bearer " + APP_TOKEN
+    if not APP_TOKEN or auth != expected:
+        return jsonify({"error": "Authentication required. Send 'Authorization: Bearer <APP_TOKEN>'."}), 401
+    return None
+
+
+def current_session_id():
+    """Stable per-browser session id stored in the signed Flask session cookie."""
+    sid = session.get("_sid")
+    if not sid:
+        sid = os.urandom(16).hex()
+        session["_sid"] = sid
+    return sid
+
+
+def validate_e164(phone):
+    """Return the phone as strict E.164, or None when not a valid real number."""
+    try:
+        import phonenumbers
+        num = phonenumbers.parse(phone or "", None)
+        if phonenumbers.is_possible_number(num) and phonenumbers.is_valid_number(num):
+            return phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164)
+    except Exception:
+        pass
+    return None
+
+
+def mask_phone(phone):
+    """Mask a phone number for logs/responses: +91 •••• •••• 3210."""
+    if not phone:
+        return ""
+    try:
+        import phonenumbers as _pn
+        num = _pn.parse(phone.replace(" ", ""), None)
+        cc = "+" + str(num.country_code)
+        digits = str(num.national_number)
+    except Exception:
+        import re
+        m = re.match(r"^(\+\d{1,3})(\d+)$", phone.replace(" ", ""))
+        if not m:
+            return phone
+        cc, digits = m.group(1), m.group(2)
+    if len(digits) <= 4:
+        return cc + "••••"
+    return cc + "•••• •••• " + digits[-4:]
 
 # HTML template for interactive demo page
 DEMO_HTML = """
@@ -136,6 +210,9 @@ DEMO_HTML = """
                     <input type="email" id="email" placeholder="john@example.com" value="john@example.com">
                     <label>Lead's Company (optional)</label>
                     <input type="text" id="company" placeholder="XYZ Inc" value="XYZ Inc">
+                    <label>API Token (required)</label>
+                    <input type="password" id="api-token" placeholder="APP_TOKEN set by the operator" autocomplete="off">
+                    <label><input type="checkbox" id="live-confirm" style="width:auto; margin-right:6px;">I understand live calls are enabled server-side and this places a real phone call</label>
                     <button class="btn btn-green" id="btn-call" onclick="submitLead()" disabled>Place CALL-E Follow-up Call</button>
                     <div class="status" id="call-status"></div>
                     <div class="result-box" id="call-result"></div>
@@ -198,6 +275,18 @@ DEMO_HTML = """
         let callSid = null;
         let pollTimer = null;
 
+        function apiToken() {
+            return (document.getElementById('api-token') || {}).value || '';
+        }
+
+        function authHeaders(extra) {
+            const h = Object.assign({ 'Authorization': 'Bearer ' + apiToken() }, extra || {});
+            if (document.getElementById('live-confirm') && document.getElementById('live-confirm').checked) {
+                h['X-Confirm-Live-Call'] = 'I understand this places a real phone call';
+            }
+            return h;
+        }
+
         function submitLead() {
             const data = {
                 name: document.getElementById('name').value,
@@ -218,7 +307,7 @@ DEMO_HTML = """
 
             fetch('/lead-submission', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: authHeaders({ 'Content-Type': 'application/json' }),
                 body: JSON.stringify(data)
             })
             .then(r => r.json().then(res => ({ res, ok: r.ok })))
@@ -250,7 +339,7 @@ DEMO_HTML = """
 
         function pollCallStatus() {
             if (pollTimer) clearTimeout(pollTimer);
-            fetch('/call-status/' + callSid)
+            fetch('/call-status/' + callSid, { headers: authHeaders() })
             .then(r => r.json())
             .then(res => {
                 if (res.error) {
@@ -315,7 +404,24 @@ DEMO_HTML = """
         }
 
         function startOAuth() {
-            window.location.href = '/oauth';
+            fetch('/oauth', { headers: authHeaders() })
+            .then(r => r.json())
+            .then(res => {
+                if (res.url) {
+                    window.location.href = res.url;
+                } else if (res.error) {
+                    const statusBox = document.getElementById('oauth-status');
+                    statusBox.style.display = 'block';
+                    statusBox.className = 'status error';
+                    statusBox.textContent = 'Error: ' + res.error;
+                }
+            })
+            .catch(err => {
+                const statusBox = document.getElementById('oauth-status');
+                statusBox.style.display = 'block';
+                statusBox.className = 'status error';
+                statusBox.textContent = 'Request failed: ' + err;
+            });
         }
 
         function disconnectOAuth() {
@@ -323,7 +429,7 @@ DEMO_HTML = """
             statusBox.style.display = 'block';
             statusBox.className = 'status info';
             statusBox.textContent = 'Disconnecting...';
-            fetch('/oauth-disconnect', { method: 'POST' })
+            fetch('/oauth-disconnect', { method: 'POST', headers: authHeaders() })
             .then(r => r.json())
             .then(res => {
                 if (res.error) {
@@ -380,11 +486,13 @@ DEMO_HTML = """
             if (tzTimer) clearTimeout(tzTimer);
             tzTimer = setTimeout(() => {
                 display.textContent = 'Detecting timezone...';
-                fetch('/detect-timezone?phone=' + encodeURIComponent(phone))
+                fetch('/detect-timezone?phone=' + encodeURIComponent(phone), { headers: authHeaders() })
                 .then(r => r.json())
                 .then(res => {
                     if (res.timezone) {
                         display.textContent = 'Detected timezone: ' + (res.label || res.timezone);
+                    } else if (res.error) {
+                        display.textContent = res.error;
                     } else {
                         display.textContent = 'Timezone unknown - the meeting will use your timezone.';
                     }
@@ -418,7 +526,7 @@ DEMO_HTML = """
         }
 
         function checkOAuthStatus() {
-            fetch('/oauth-status')
+            fetch('/oauth-status', { headers: authHeaders() })
             .then(r => r.json())
             .then(res => {
                 const connected = document.getElementById('oauth-connected');
@@ -516,7 +624,7 @@ DEMO_HTML = """
             statusBox.className = 'status info';
             statusBox.textContent = 'Uploading and starting batch...';
 
-            fetch('/batch-upload', { method: 'POST', body: fd })
+            fetch('/batch-upload', { method: 'POST', headers: authHeaders(), body: fd })
             .then(r => r.json().then(res => ({ res, ok: r.ok })))
             .then(({ res, ok }) => {
                 if (!ok || res.error) {
@@ -541,7 +649,7 @@ DEMO_HTML = """
         function pollBatch() {
             if (!currentBatchId) return;
             if (batchPollTimer) clearTimeout(batchPollTimer);
-            fetch('/batch-status/' + currentBatchId)
+            fetch('/batch-status/' + currentBatchId, { headers: authHeaders() })
             .then(r => r.json())
             .then(res => {
                 if (res.error) return;
@@ -574,7 +682,7 @@ DEMO_HTML = """
 
         function stopBatch() {
             if (!currentBatchId) return;
-            fetch('/batch-stop/' + currentBatchId, { method: 'POST' })
+            fetch('/batch-stop/' + currentBatchId, { method: 'POST', headers: authHeaders() })
             .then(r => r.json())
             .then(res => {
                 document.getElementById('batch-status').textContent = 'Stopping after current call...';
@@ -584,7 +692,24 @@ DEMO_HTML = """
 
         function downloadBatch() {
             if (!currentBatchId) return;
-            window.location.href = '/batch-download/' + currentBatchId;
+            fetch('/batch-download/' + currentBatchId, { headers: authHeaders() })
+            .then(r => {
+                if (!r.ok) return r.json().then(res => { throw new Error(res.error || 'Download failed'); });
+                return r.blob();
+            })
+            .then(blob => {
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'batch_' + currentBatchId + '.xlsx';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+            })
+            .catch(err => {
+                document.getElementById('batch-status').textContent = 'Download error: ' + err.message;
+            });
         }
     </script>
 </body>
@@ -596,36 +721,43 @@ DEMO_HTML = """
 # GOOGLE CALENDAR OAUTH & INTEGRATION
 # ============================================================
 
-def get_google_credentials():
-    """Get valid Google OAuth credentials, initiating flow if needed.
+def get_google_credentials(session_id=None):
+    """Get valid Google OAuth credentials for the calling session.
 
-    Loads the scopes the token was originally granted, so refresh works.
-    Returns None if credentials are missing or cannot be refreshed.
+    Tokens are stored per-session in server memory by default. Disk
+    persistence / env restore happens only when PERSIST_GOOGLE_TOKEN=true
+    (explicit operator opt-in). Returns None when unavailable.
     """
+    sid = session_id or current_session_id()
     creds = None
-    
-    # Load credentials from session file (use stored scopes so refresh works)
-    if os.path.exists(CREDENTIALS_FILE):
+
+    stored_json = oauth_tokens.get(sid)
+    if stored_json:
         try:
-            creds = Credentials.from_authorized_user_file(CREDENTIALS_FILE)
+            creds = Credentials.from_authorized_user_info(stored_json)
         except Exception:
-            return None
-    elif os.environ.get("GOOGLE_TOKEN_JSON") and not os.path.exists(DISCONNECT_FLAG):
-        # Render free instances have ephemeral disk: restore the token from an
-        # env var so restarts keep the connection (refresh token stays valid).
-        # A Disconnect click drops the flag file so the user stays disconnected.
-        try:
-            creds = Credentials.from_authorized_user_info(
-                json.loads(os.environ["GOOGLE_TOKEN_JSON"])
-            )
-            save_credentials(creds)
-        except Exception as e:
-            print(f"GOOGLE_TOKEN_JSON restore failed: {e}")
-            return None
-    
-    # If no (valid) credentials, let the user log in
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+            creds = None
+    if creds is None and PERSIST_TOKEN:
+        if os.path.exists(CREDENTIALS_FILE):
+            try:
+                creds = Credentials.from_authorized_user_file(CREDENTIALS_FILE)
+            except Exception:
+                creds = None
+        elif os.environ.get("GOOGLE_TOKEN_JSON") and not os.path.exists(DISCONNECT_FLAG):
+            # Operator-configured restore (ephemeral-disk hosts, e.g. Render).
+            # A Disconnect click drops the flag file so the user stays disconnected.
+            try:
+                creds = Credentials.from_authorized_user_info(
+                    json.loads(os.environ["GOOGLE_TOKEN_JSON"])
+                )
+                save_credentials(creds, session_id=sid)
+            except Exception as e:
+                print(f"GOOGLE_TOKEN_JSON restore failed: {e}")
+                creds = None
+
+    # Refresh when expired, fail closed otherwise.
+    if creds and not creds.valid:
+        if creds.expired and creds.refresh_token:
             try:
                 from google.auth.transport.requests import Request
                 creds.refresh(Request())
@@ -633,16 +765,20 @@ def get_google_credentials():
                 print(f"Google credential refresh failed: {e}")
                 return None
         else:
-            # Return None; the /oauth route handles the interactive flow
             return None
-    
+
+    if creds:
+        oauth_tokens[sid] = json.loads(creds.to_json())
     return creds
 
 
-def save_credentials(creds):
-    """Save credentials to session file."""
-    with open(CREDENTIALS_FILE, "w") as f:
-        f.write(creds.to_json())
+def save_credentials(creds, session_id=None):
+    """Save credentials for a session; persist to disk only on explicit opt-in."""
+    sid = session_id or current_session_id()
+    oauth_tokens[sid] = json.loads(creds.to_json())
+    if PERSIST_TOKEN:
+        with open(CREDENTIALS_FILE, "w") as f:
+            f.write(creds.to_json())
 
 
 def parse_preferred_time(preferred_time):
@@ -1198,18 +1334,40 @@ CALL_E_RESULT_SCHEMA = {
 }
 
 
-def place_call_e_call(to_number, message, result_schema=None):
-    """Place outbound call using CALL-E Python SDK."""
+def lead_idempotency_key(name, email, phone, company, your_company, day):
+    """Deterministic provider idempotency key: an exact retry never re-calls."""
+    import hashlib
+    digest = hashlib.sha256(
+        "|".join([name or "", email or "", phone or "", company or "", your_company or "", day or ""]).encode()
+    ).hexdigest()
+    return "lead-" + digest[:40]
+
+
+def place_call_e_call(to_number, message, result_schema=None, idempotency_key=None):
+    """Place an outbound CALL-E call, but only when live mode is explicitly enabled.
+
+    Without CALLE_LIVE_CALLS_ENABLED=true the result is a clearly marked
+    simulation (status 'simulated') and no call is ever placed.
+    """
+    if not LIVE_CALLS_ENABLED:
+        return {
+            "sid": None,
+            "status": "simulated",
+            "mode": "simulated",
+            "simulated": True,
+            "error": "Live calls are disabled server-side. Set CALLE_LIVE_CALLS_ENABLED=true to enable.",
+        }
     try:
         result = call_e_client.call(
             to_number=to_number,
             message=message,
             result_schema=result_schema,
+            idempotency_key=idempotency_key,
         )
         return result
     except Exception as e:
         print(f"CALL-E Error: {e}")
-        return {"sid": "demo-call-123", "status": "queued"}
+        return {"sid": None, "status": "failed", "error": str(e), "mode": "real"}
 
 
 # ============================================================
@@ -1225,9 +1383,33 @@ def index():
 def lead_submission():
     """Handle lead form submission - triggers CALL-E call flow."""
     try:
+        auth_err = require_token()
+        if auth_err:
+            return auth_err
+
+        # Final opt-in for live calls: every live submission must carry the
+        # confirmation header. Simulations need no header.
+        if LIVE_CALLS_ENABLED:
+            confirm = request.headers.get("X-Confirm-Live-Call", "")
+            if confirm != "I understand this places a real phone call":
+                return jsonify({
+                    "error": "Live calls require the confirmation header "
+                             "'X-Confirm-Live-Call: I understand this places a real phone call'.",
+                }), 403
+
         lead_data = request.get_json()
         if not lead_data:
             return jsonify({"error": "No JSON data received"}), 400
+
+        name = lead_data.get("name", "").strip() or "Valued Customer"
+        email = lead_data.get("email", "").strip()
+        phone = validate_e164(lead_data.get("phone", ""))
+        if not phone:
+            return jsonify({"error": "Invalid phone number (must be a valid E.164 number)."}), 400
+        company = lead_data.get("company", "")  # lead's company
+        your_company = lead_data.get("your_company", "Company")  # caller's company
+        company_tz = lead_data.get("company_tz", "UTC") or "UTC"  # caller's timezone
+        lead_tz = get_lead_timezone(phone)  # derived from phone number
 
         # Gate: require Google (Calendar + Gmail) connection before placing calls
         creds = get_google_credentials()
@@ -1242,14 +1424,6 @@ def lead_submission():
                 "error": "Google Calendar & Gmail are not connected. Visit /oauth to authorize, then retry.",
                 "status": "oauth_required",
             }), 403
-
-        name = lead_data.get("name", "Valued Customer")
-        email = lead_data.get("email", "")
-        phone = lead_data.get("phone", "+1234567890")
-        company = lead_data.get("company", "")  # lead's company
-        your_company = lead_data.get("your_company", "Company")  # caller's company
-        company_tz = lead_data.get("company_tz", "UTC") or "UTC"  # caller's timezone
-        lead_tz = get_lead_timezone(phone)  # derived from phone number
 
         # Pre-compute tomorrow's free 30-min slots (10 AM-6 PM) so the agent
         # can offer only available times and handle "that time is taken".
@@ -1267,6 +1441,7 @@ def lead_submission():
             to_number=phone,
             message=generate_call_message(name, your_company, company, lead_tz, slots),
             result_schema=CALL_E_RESULT_SCHEMA,
+            idempotency_key=lead_idempotency_key(name, email, phone, company, your_company, "tomorrow"),
         )
 
         call_sid = call_result.get("sid")
@@ -1281,6 +1456,8 @@ def lead_submission():
                 "your_company": your_company,
                 "company_tz": company_tz,
                 "lead_tz": lead_tz,
+                "session_id": current_session_id(),
+                "simulated": bool(call_result.get("simulated")),
             }
 
         # Combine results
@@ -1288,8 +1465,14 @@ def lead_submission():
             "status": "success",
             "call_sid": call_sid,
             "call_status": call_result.get("status"),
+            "mode": call_result.get("mode", "simulated"),
             "message": f"Follow-up call initiated for {name} from {your_company}"
         }
+        if call_result.get("simulated"):
+            response["message"] = (
+                f"Simulated follow-up for {name} from {your_company} "
+                f"(live calls disabled server-side) - no call was placed and nothing will be booked."
+            )
 
         return jsonify(response)
 
@@ -1297,10 +1480,49 @@ def lead_submission():
         return jsonify({"error": str(e)}), 500
 
 
+def booking_decision(status, structured, simulated=False):
+    """Fail-closed decision whether a booking may be made.
+
+    Returns (preferred_day, preferred_time, confirmed_tz) or None. A booking
+    is possible only when ALL of the following hold:
+      - the provider reported the authoritative terminal status 'completed';
+      - the call was a real call (never from a simulation/shim);
+      - the structured result is a non-empty dict (confirmation evidence);
+      - wants_appointment == 'yes' and time_confirmed == 'yes' (explicit);
+      - preferred_day is today/tomorrow and preferred_time parses as HH:MM;
+      - the lead-confirmed timezone is present and not 'unknown'.
+    Anything else returns None and no event is created.
+    """
+    if simulated:
+        return None
+    if status != "completed":
+        return None
+    if not isinstance(structured, dict) or not structured:
+        return None
+    if structured.get("wants_appointment") != "yes":
+        return None
+    if structured.get("time_confirmed") != "yes":
+        return None
+    day = structured.get("preferred_day")
+    time_str = structured.get("preferred_time")
+    tz = structured.get("timezone")
+    if day not in ("today", "tomorrow"):
+        return None
+    if not time_str or time_str == "unknown" or parse_preferred_time(time_str) is None:
+        return None
+    if not tz or tz == "unknown":
+        return None
+    return day, time_str, tz
+
+
 @app.route("/call-status/<call_id>")
 def call_status(call_id):
     """Poll the CALL-E call and, when done, schedule the appointment at the lead's preferred time."""
     try:
+        auth_err = require_token()
+        if auth_err:
+            return auth_err
+
         lead = pending_leads.get(call_id, {})
 
         if call_e_client.using_real_sdk:
@@ -1309,9 +1531,9 @@ def call_status(call_id):
             structured = raw.get("structured_result") or {}
             summary = raw.get("summary")
         else:
-            status = "completed"
+            status = "simulated"
             structured = {}
-            summary = "demo call"
+            summary = "simulated call"
 
         response = {
             "call_id": call_id,
@@ -1323,52 +1545,49 @@ def call_status(call_id):
         # Only schedule once the call reached a terminal state
         terminal = status in ("completed", "failed", "canceled")
         if terminal and call_id in pending_leads:
-            wants = (structured or {}).get("wants_appointment")
-            if wants == "yes":
-                preferred_day = (structured or {}).get("preferred_day", "tomorrow")
-                preferred_time = (structured or {}).get("preferred_time")
-                time_confirmed = (structured or {}).get("time_confirmed", "unknown")
-                if preferred_time and preferred_time not in ("unknown",) and time_confirmed != "no":
-                    # Prefer the timezone the lead confirmed; else fall back to the
-                    # phone-derived timezone, then the company timezone.
-                    confirmed_tz = (structured or {}).get("timezone")
-                    lead_tz = confirmed_tz if confirmed_tz and confirmed_tz != "unknown" else lead.get("lead_tz")
-                    response["calendar"] = schedule_google_calendar(
+            decision = booking_decision(
+                status, structured, simulated=bool(lead.get("simulated"))
+            )
+            if decision is not None:
+                preferred_day, preferred_time, confirmed_tz = decision
+                response["calendar"] = schedule_google_calendar(
+                    lead.get("name", "Valued Customer"),
+                    lead.get("email", ""),
+                    lead.get("phone", ""),
+                    lead.get("company", ""),
+                    your_company=lead.get("your_company", "Company"),
+                    preferred_day=preferred_day,
+                    preferred_time=preferred_time,
+                    call_sid=call_id,
+                    lead_tz=confirmed_tz,
+                    company_tz=lead.get("company_tz", "UTC"),
+                )
+                # Send confirmation email once the event is on the calendar
+                if response["calendar"].get("status") == "success":
+                    response["email"] = send_confirmation_email(
                         lead.get("name", "Valued Customer"),
                         lead.get("email", ""),
-                        lead.get("phone", ""),
                         lead.get("company", ""),
+                        response["calendar"],
+                        lead.get("phone", ""),
                         your_company=lead.get("your_company", "Company"),
-                        preferred_day=preferred_day,
-                        preferred_time=preferred_time,
-                        call_sid=call_id,
-                        lead_tz=lead_tz,
-                        company_tz=lead.get("company_tz", "UTC"),
                     )
-                    # Send confirmation email once the event is on the calendar
-                    if response["calendar"].get("status") == "success":
-                        response["email"] = send_confirmation_email(
-                            lead.get("name", "Valued Customer"),
-                            lead.get("email", ""),
-                            lead.get("company", ""),
-                            response["calendar"],
-                            lead.get("phone", ""),
-                            your_company=lead.get("your_company", "Company"),
-                        )
-                elif preferred_time and preferred_time not in ("unknown",) and time_confirmed == "no":
-                    response["calendar"] = {
-                        "status": "not_confirmed",
-                        "message": "Lead did not confirm the time/timezone - no appointment scheduled.",
-                    }
-                else:
-                    response["calendar"] = {
-                        "status": "no_time",
-                        "message": "Lead accepted appointment but no specific time was captured.",
-                    }
-            else:
+            elif structured and structured.get("time_confirmed") == "no":
+                response["calendar"] = {
+                    "status": "not_confirmed",
+                    "message": "Lead did not confirm the time/timezone - no appointment scheduled.",
+                }
+            elif structured and structured.get("wants_appointment") != "yes":
                 response["calendar"] = {
                     "status": "no_appointment",
-                    "message": f"Lead did not request an appointment (wants_appointment={wants}).",
+                    "message": f"Lead did not request an appointment (wants_appointment={structured.get('wants_appointment')}).",
+                }
+            else:
+                response["calendar"] = {
+                    "status": "evidence_required",
+                    "message": "Booking skipped: the call result did not meet the fail-closed "
+                               "requirements (authoritative completion, explicit time confirmation, "
+                               "bound day/time, and confirmed timezone).",
                 }
             # Stop tracking once processed
             del pending_leads[call_id]
@@ -1451,8 +1670,17 @@ def read_batch_rows(file_storage):
         for field in BATCH_HEADERS:
             idx = matched.get(field)
             row[field] = str(line[idx]).strip() if idx is not None and idx < len(line) and line[idx] is not None else ""
-        row["your_company"] = row["your_company"] or "Company"
-        row["company_tz"] = row.get("company_tz") or ""
+        # Validate phone to strict E.164; invalid rows are marked 'error'
+        # (imported lazily so batch uploads work even without phonenumbers).
+        import phonenumbers as _pn  # noqa: F401
+        e164 = validate_e164(row["phone"])
+        if not e164:
+            row["status"] = "error"
+            row["error"] = "Invalid phone number (must be a valid E.164 number)."
+            row["_invalid"] = True
+            rows.append(row)
+            continue
+        row["phone"] = e164
         row["lead_tz"] = get_lead_timezone(row["phone"])
 
         # Skip rows already successfully scheduled in a previous run
@@ -1470,6 +1698,10 @@ def process_batch(batch_id):
     """Background worker: process batch rows sequentially."""
     job = batch_jobs[batch_id]
     for row in job["rows"]:
+        # Rows rejected at upload (e.g. invalid phone) are already terminal.
+        if row.get("_invalid") or row.get("status") in ("error", "stopped", "simulated"):
+            job["done_count"] += 1
+            continue
         if job.get("stop"):
             row["status"] = "stopped"
             job["done_count"] += 1
@@ -1481,7 +1713,7 @@ def process_batch(batch_id):
             # can offer only available times.
             slots = None
             try:
-                creds = get_google_credentials()
+                creds = get_google_credentials(session_id=job.get("session_id"))
                 if creds:
                     service = build("calendar", "v3", credentials=creds)
                     tomorrow = (datetime.utcnow() + timedelta(days=1)).date()
@@ -1497,8 +1729,18 @@ def process_batch(batch_id):
                 to_number=row["phone"],
                 message=generate_call_message(row["name"], row["your_company"], row["company"], row.get("lead_tz"), slots),
                 result_schema=CALL_E_RESULT_SCHEMA,
+                idempotency_key=lead_idempotency_key(
+                    row["name"], row["email"], row["phone"], row["company"],
+                    row["your_company"], "tomorrow",
+                ),
             )
             row["call_sid"] = call_result.get("sid")
+            row["simulated"] = bool(call_result.get("simulated"))
+            if call_result.get("simulated"):
+                row["status"] = "simulated"
+                row["error"] = "Live calls disabled server-side (CALLE_LIVE_CALLS_ENABLED) - no call placed."
+                job["done_count"] += 1
+                continue
             row["status"] = "waiting"
 
             # Poll until terminal state (up to ~10 min)
@@ -1515,7 +1757,7 @@ def process_batch(batch_id):
                         status = raw.get("status")
                         structured = raw.get("structured_result") or {}
                     else:
-                        status = "completed"
+                        status = "simulated"
                         structured = {}
                     if status in ("completed", "failed", "canceled"):
                         row["call_status"] = status
@@ -1530,19 +1772,16 @@ def process_batch(batch_id):
 
             if job.get("stop"):
                 row["status"] = "stopped"
-            elif terminal and status == "completed" and structured.get("wants_appointment") == "yes":
-                preferred_day = structured.get("preferred_day", "tomorrow")
-                preferred_time = structured.get("preferred_time")
-                time_confirmed = structured.get("time_confirmed", "unknown")
-                if preferred_time and preferred_time not in ("unknown",) and time_confirmed != "no":
-                    confirmed_tz = structured.get("timezone")
-                    lead_tz = confirmed_tz if confirmed_tz and confirmed_tz != "unknown" else row.get("lead_tz")
+            elif terminal and status == "completed":
+                decision = booking_decision(status, structured, simulated=bool(row.get("simulated")))
+                if decision is not None:
+                    preferred_day, preferred_time, confirmed_tz = decision
                     cal = schedule_google_calendar(
                         row["name"], row["email"], row["phone"], row["company"],
                         your_company=row["your_company"],
                         preferred_day=preferred_day, preferred_time=preferred_time,
                         call_sid=row["call_sid"],
-                        lead_tz=lead_tz,
+                        lead_tz=confirmed_tz,
                         company_tz=row.get("company_tz") or "UTC",
                     )
                     if cal.get("status") == "success":
@@ -1560,12 +1799,15 @@ def process_batch(batch_id):
                     else:
                         row["status"] = "error"
                         row["error"] = cal.get("message", "scheduling failed")
-                elif preferred_time and preferred_time not in ("unknown",) and time_confirmed == "no":
+                elif structured and structured.get("time_confirmed") == "no":
                     row["status"] = "not_confirmed"
                     row["error"] = "Lead did not confirm the time/timezone."
+                elif structured and structured.get("wants_appointment") != "yes":
+                    row["status"] = "declined"
+                    row["error"] = "Lead did not request an appointment."
                 else:
                     row["status"] = "no_time"
-                    row["error"] = "Lead accepted but no time captured."
+                    row["error"] = "Booking skipped: call result lacked the fail-closed evidence (authoritative completion, explicit time confirmation, bound day/time, confirmed timezone)."
             elif terminal and status == "failed":
                 row["status"] = "failed"
                 row["error"] = "Call did not connect."
@@ -1584,6 +1826,18 @@ def process_batch(batch_id):
 def batch_upload():
     """Upload an Excel/CSV file and process leads sequentially."""
     try:
+        auth_err = require_token()
+        if auth_err:
+            return auth_err
+
+        if LIVE_CALLS_ENABLED:
+            confirm = request.headers.get("X-Confirm-Live-Call", "")
+            if confirm != "I understand this places a real phone call":
+                return jsonify({
+                    "error": "Live calls require the confirmation header "
+                             "'X-Confirm-Live-Call: I understand this places a real phone call'.",
+                }), 403
+
         creds = get_google_credentials()
         if not creds:
             return jsonify({"error": "Google not connected. Visit /oauth first."}), 403
@@ -1608,6 +1862,7 @@ def batch_upload():
             "done_count": 0,
             "running": True,
             "stop": False,
+            "session_id": current_session_id(),
             "created": datetime.utcnow().isoformat(),
         }
 
@@ -1627,7 +1882,10 @@ def batch_upload():
 
 @app.route("/batch-status/<batch_id>")
 def batch_status(batch_id):
-    """Return current progress of a batch job."""
+    """Return current progress of a batch job (phone numbers masked)."""
+    auth_err = require_token()
+    if auth_err:
+        return auth_err
     job = batch_jobs.get(batch_id)
     if not job:
         return jsonify({"error": "Batch not found"}), 404
@@ -1640,7 +1898,7 @@ def batch_status(batch_id):
         "rows": [
             {
                 "name": r["name"],
-                "phone": r["phone"],
+                "phone": mask_phone(r["phone"]),
                 "company": r["company"],
                 "your_company": r["your_company"],
                 "company_tz": r.get("company_tz") or "UTC",
@@ -1660,6 +1918,9 @@ def batch_status(batch_id):
 @app.route("/batch-stop/<batch_id>", methods=["POST"])
 def batch_stop(batch_id):
     """Stop a running batch after the current call completes."""
+    auth_err = require_token()
+    if auth_err:
+        return auth_err
     job = batch_jobs.get(batch_id)
     if not job:
         return jsonify({"error": "Batch not found"}), 404
@@ -1669,7 +1930,13 @@ def batch_stop(batch_id):
 
 @app.route("/batch-download/<batch_id>")
 def batch_download(batch_id):
-    """Download the batch as an updated Excel file with a status column."""
+    """Download the batch as an updated Excel file with a status column.
+
+    Phone numbers are masked in the exported file for privacy.
+    """
+    auth_err = require_token()
+    if auth_err:
+        return auth_err
     job = batch_jobs.get(batch_id)
     if not job:
         return jsonify({"error": "Batch not found"}), 404
@@ -1685,7 +1952,7 @@ def batch_download(batch_id):
 
     for r in job["rows"]:
         ws.append([
-            r.get("name", ""), r.get("phone", ""), r.get("email", ""),
+            r.get("name", ""), mask_phone(r.get("phone", "")), r.get("email", ""),
             r.get("company", ""), r.get("your_company", ""), r.get("company_tz", ""),
             r.get("status", "pending"), r.get("appointment", ""),
             r.get("call_sid", ""), r.get("event_id", ""),
@@ -1705,45 +1972,66 @@ def batch_download(batch_id):
 
 @app.route("/oauth2callback")
 def oauth2callback():
-    """Handle Google OAuth callback."""
-    # Get the authorization code from the request
+    """Handle Google OAuth callback.
+
+    This route is reached by browser navigation, so bearer auth cannot be
+    attached. It is authenticated by the state parameter: the callback is
+    accepted only when the state matches the one stored in this browser's
+    signed session cookie, and the exchange uses PKCE. Everything else fails
+    closed with a 400.
+    """
     auth_code = request.args.get("code")
-    
+    state = request.args.get("state", "")
+    error = request.args.get("error", "")
+
+    if error:
+        return jsonify({"error": f"OAuth error: {error}"}), 400
     if not auth_code:
         return jsonify({"error": "No authorization code provided"}), 400
-    
+
+    expected_state = session.pop("oauth_state", None)
+    code_verifier = session.pop("oauth_code_verifier", None)
+    if not expected_state or not code_verifier:
+        return jsonify({"error": "OAuth state missing - start the flow from the app."}), 400
+    if state != expected_state:
+        return jsonify({"error": "OAuth state mismatch - the callback was rejected."}), 400
+
     try:
         from google_auth_oauthlib.flow import Flow
-        
+
         flow = Flow.from_client_config(
             GOOGLE_OAUTH_CONFIG,
             scopes=GOOGLE_SCOPES,
             autogenerate_code_verifier=False,
         )
         flow.redirect_uri = GOOGLE_REDIRECT_URI
-        
-        # Fetch the token
+        flow.code_verifier = code_verifier
+
         flow.fetch_token(code=auth_code)
         creds = flow.credentials
-        
-        # Save credentials
+
+        # Save per-session; disk persistence only on explicit operator opt-in.
         save_credentials(creds)
         if os.path.exists(DISCONNECT_FLAG):
             os.remove(DISCONNECT_FLAG)
-        
-        # Send the user back to the main page, which now reflects the connected state
+
         return redirect("/?oauth=connected")
-        
+
     except Exception as e:
         return redirect("/?oauth=error&message=" + str(e))
 
 
 @app.route("/detect-timezone")
 def detect_timezone():
-    """Return the timezone derived from a phone number's country code."""
+    """Return the timezone derived from a valid E.164 phone number."""
+    auth_err = require_token()
+    if auth_err:
+        return auth_err
     phone = request.args.get("phone", "")
     if not phone:
         return jsonify({"timezone": None, "label": None})
+    if not validate_e164(phone):
+        return jsonify({"error": "Invalid phone number (must be a valid E.164 number)."}), 400
     try:
         tz = get_lead_timezone(phone)
         return jsonify({"timezone": tz, "label": tz_friendly_name(tz)})
@@ -1753,8 +2041,10 @@ def detect_timezone():
 
 @app.route("/oauth-status")
 def oauth_status():
-    """Return whether Google is connected and with which account/scopes."""
-    import urllib.parse
+    """Return whether Google is connected and with which account/scopes (account masked)."""
+    auth_err = require_token()
+    if auth_err:
+        return auth_err
 
     creds = get_google_credentials()
     if not creds:
@@ -1765,7 +2055,12 @@ def oauth_status():
     try:
         service = build("gmail", "v1", credentials=creds)
         profile = service.users().getProfile(userId="me").execute()
-        account = profile.get("emailAddress")
+        email = profile.get("emailAddress") or ""
+        if "@" in email:
+            local, _, domain = email.partition("@")
+            account = local[:2] + "***@" + domain
+        else:
+            account = None
     except Exception:
         pass
 
@@ -1778,9 +2073,14 @@ def oauth_status():
 
 @app.route("/oauth-disconnect", methods=["POST"])
 def oauth_disconnect():
-    """Revoke local Google credentials so the user can reconnect."""
+    """Revoke the calling session's Google credentials so the user can reconnect."""
+    auth_err = require_token()
+    if auth_err:
+        return auth_err
     try:
-        if os.path.exists(CREDENTIALS_FILE):
+        sid = current_session_id()
+        oauth_tokens.pop(sid, None)
+        if PERSIST_TOKEN and os.path.exists(CREDENTIALS_FILE):
             os.remove(CREDENTIALS_FILE)
         with open(DISCONNECT_FLAG, "w") as f:
             f.write("disconnected")
@@ -1791,22 +2091,30 @@ def oauth_disconnect():
 
 @app.route("/oauth")
 def oauth_start():
-    """Start Google OAuth flow - redirect to Google authorization."""
+    """Start Google OAuth flow with state validation and PKCE."""
+    auth_err = require_token()
+    if auth_err:
+        return auth_err
     try:
         from google_auth_oauthlib.flow import Flow
 
         flow = Flow.from_client_config(
             GOOGLE_OAUTH_CONFIG,
             scopes=GOOGLE_SCOPES,
-            autogenerate_code_verifier=False,
+            autogenerate_code_verifier=True,
         )
         flow.redirect_uri = GOOGLE_REDIRECT_URI
 
-        # Generate the authorization URL (prompt=consent forces a fresh refresh token)
-        auth_url, state = flow.authorization_url(access_type="offline", prompt="consent")
+        state = os.urandom(16).hex()
+        session["oauth_state"] = state
+        session["oauth_code_verifier"] = flow.code_verifier
 
-        # Redirect user to Google's authorization page
-        return redirect(auth_url)
+        auth_url, _ = flow.authorization_url(
+            access_type="offline",
+            prompt="consent",
+            state=state,
+        )
+        return jsonify({"url": auth_url})
     except Exception as e:
         return jsonify({"error": f"OAuth start failed: {str(e)}"}), 500
 
@@ -1816,17 +2124,19 @@ def oauth_start():
 # ============================================================
 
 def run_oauth_setup():
-    """Run OAuth flow to get Google credentials."""
+    """Run OAuth flow to get Google credentials (PKCE, state validated on completion)."""
     import sys
     
     flow = Flow.from_client_config(
         GOOGLE_OAUTH_CONFIG,
         scopes=GOOGLE_SCOPES,
+        autogenerate_code_verifier=True,
     )
     flow.redirect_uri = GOOGLE_REDIRECT_URI
-    
-    # Generate authorization URL
-    auth_url, state = flow.authorization_url(access_type="offline", prompt="consent")
+
+    # Generate authorization URL with a state token validated on callback
+    state = os.urandom(16).hex()
+    auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent", state=state)
     
     print("=" * 60)
     print("GOOGLE OAUTH SETUP FOR CALL-E HACKATHON")

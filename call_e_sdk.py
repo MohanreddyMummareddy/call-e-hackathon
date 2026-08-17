@@ -30,7 +30,8 @@ class CALL_EClient:
     def __init__(self, api_key=None, **kwargs):
         self.api_key = api_key or os.environ.get("CALL_E_API_KEY") or os.environ.get("CALLE_API_KEY", "")
         self.base_url = "https://api.heycall-e.com"
-        self._authenticated = bool(self.api_key)
+        # Fail closed: a placeholder default must never look like a real key.
+        self._authenticated = bool(self.api_key) and self.api_key not in ("your-api-key-here", "YOUR_API_KEY_HERE")
         if _HAS_REAL_SDK:
             self._impl = _RealCalleClient(api_key=self.api_key) if self._authenticated else None
         else:
@@ -41,7 +42,7 @@ class CALL_EClient:
         """True when the official SDK is installed and configured."""
         return _HAS_REAL_SDK and self._authenticated
 
-    def call(self, to_number, message, result_schema=None, **kwargs):
+    def call(self, to_number, message, result_schema=None, idempotency_key=None, **kwargs):
         """
         Place an outbound CALL-E call.
 
@@ -49,16 +50,22 @@ class CALL_EClient:
             to_number: Phone number to call (E.164).
             message: Natural-language task describing what the voice agent should do/say.
             result_schema: Optional JSON Schema for structured result extraction.
+            idempotency_key: Optional stable key; the provider deduplicates exact
+                retries so a re-submitted lead never becomes a second call.
 
         Returns:
-            dict: Call result with at least 'sid', 'status', and 'task' keys.
+            dict: Call result. Live results carry 'sid' and 'mode': 'real'.
+            Unconfigured/unauthenticated results are explicit simulations
+            ('mode': 'shim', 'status': 'simulated') and never claim a call was
+            accepted, placed, or completed.
         """
         if not self._authenticated:
             return {
-                "sid": "demo-call-" + str(abs(hash(message)) % 10000),
-                "status": "failed",
+                "sid": None,
+                "status": "simulated",
                 "error": "CALL-E API key not configured. Set CALL_E_API_KEY in .env.",
                 "mode": "shim",
+                "simulated": True,
             }
 
         if self.using_real_sdk:
@@ -70,6 +77,8 @@ class CALL_EClient:
                 }
                 if result_schema:
                     payload["result_schema"] = result_schema
+                if idempotency_key:
+                    payload["idempotency_key"] = idempotency_key
                 result = self._impl.calls.create(**payload)
                 return {
                     "sid": result.get("id"),
@@ -87,18 +96,18 @@ class CALL_EClient:
                     "mode": "real",
                 }
 
-        # Fallback: demo response (no official SDK installed)
+        # No official SDK installed: never claim a real call was accepted.
         return {
-            "sid": "call-" + str(abs(hash((to_number, message))) % 100000),
-            "status": "queued",
+            "sid": None,
+            "status": "simulated",
             "to_number": to_number,
-            "message": message[:50] + "..." if len(message) > 50 else message,
-            "mode": "demo",
+            "mode": "shim",
+            "simulated": True,
         }
 
     def status(self, call_sid, **kwargs):
-        """Check call status."""
-        if self.using_real_sdk and call_sid and call_sid != "error":
+        """Check call status. Never fabricates completion for simulated calls."""
+        if self.using_real_sdk and call_sid and call_sid not in ("error", "simulated"):
             try:
                 result = self._impl.calls.get(call_sid)
                 return {
@@ -110,16 +119,16 @@ class CALL_EClient:
                 return {"call_sid": call_sid, "status": "error", "error": str(e)}
         return {
             "call_sid": call_sid,
-            "status": "completed",
-            "duration": "00:01:30",
+            "status": "simulated",
+            "simulated": True,
         }
 
 
 # Provide a module-level convenience function matching the SDK API
-def place_call(to_number, message, api_key=None, result_schema=None):
+def place_call(to_number, message, api_key=None, result_schema=None, idempotency_key=None):
     """Place a CALL-E call from module level."""
     client = CALL_EClient(api_key=api_key)
-    return client.call(to_number=to_number, message=message, result_schema=result_schema)
+    return client.call(to_number=to_number, message=message, result_schema=result_schema, idempotency_key=idempotency_key)
 
 
 # Export the class and convenience function
