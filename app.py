@@ -90,15 +90,20 @@ batch_jobs = {}
 # AUTH / PRIVACY HELPERS
 # ============================================================
 
-def require_token():
+def require_token(strict=False):
     """Fail closed on every protected route: a valid Bearer APP_TOKEN is mandatory.
 
-    Exception: when live calls are disabled AND the operator has not set
-    APP_TOKEN, the app runs as a credential-free preview. Nothing can be
-    dialed, booked, or persisted in that mode, so the routes are opened to
-    make the documented preview runnable without any credentials.
+    `strict=True` (call-result, OAuth, batch, and data routes) always requires
+    authentication, even in the credential-free preview: an operator may run a
+    preview with a provider key present, and an unauthenticated caller must not
+    be able to query call status/results or exported data in that configuration.
+
+    The non-strict gate (lead submission only) opens when live calls are
+    disabled AND the operator has not set APP_TOKEN, so the documented fake
+    preview stays runnable without any credentials. Nothing can be dialed,
+    booked, or persisted in that mode.
     """
-    if not LIVE_CALLS_ENABLED and not APP_TOKEN:
+    if not strict and not LIVE_CALLS_ENABLED and not APP_TOKEN:
         return None
     auth = request.headers.get("Authorization", "")
     expected = "Bearer " + APP_TOKEN
@@ -231,7 +236,7 @@ DEMO_HTML = """
                 <div id="bulk-mode" style="display:none;">
                     <p style="font-size:14px; color:#4a5568;">
                         Upload an Excel/CSV file with columns: <strong>name, phone, email, company, your_company</strong> (first row = headers, <strong>company_tz</strong> and <strong>consent</strong> optional; set consent=yes for every recipient you are authorized to call).
-                        Calls happen sequentially. After processing, download the file with a <strong>status</strong> column added.
+                        Calls happen sequentially. If a call's status becomes unknown (provider lookup failure or polling timeout), the batch <strong>stops</strong> and the remaining rows are marked <strong>stopped</strong>. After processing, download the file with a <strong>status</strong> column added.
                         Re-uploading the same file only calls leads that were <strong>not</strong> successfully scheduled.
                     </p>
                     <input type="file" id="batch-file" accept=".xlsx,.csv" style="padding:6px; border:1px solid #e2e8f0; border-radius:8px;">
@@ -1459,14 +1464,29 @@ def lead_submission():
 
         # Pre-compute tomorrow's free 30-min slots (10 AM-6 PM) so the agent
         # can offer only available times and handle "that time is taken".
+        # Live mode fails closed BEFORE dialing: if the calendar lookup fails
+        # or no calendar-confirmed slot is free, no call is placed at all.
         slots = None
-        try:
-            service = build("calendar", "v3", credentials=creds)
-            tomorrow = (datetime.utcnow() + timedelta(days=1)).date()
-            slots = get_available_slots(service, tomorrow, company_tz, lead_tz)
-        except Exception as e:
-            print(f"Slot computation failed: {e}")
-            slots = None
+        if LIVE_CALLS_ENABLED:
+            try:
+                service = build("calendar", "v3", credentials=creds)
+                tomorrow = (datetime.utcnow() + timedelta(days=1)).date()
+                slots = get_available_slots(service, tomorrow, company_tz, lead_tz)
+            except Exception as e:
+                print(f"Slot computation failed: {e}")
+                return jsonify({
+                    "error": f"Calendar availability lookup failed ({e}); no call was placed. "
+                             "Retry when the calendar can be checked, or book manually.",
+                    "status": "availability_failed",
+                }), 502
+            if not slots:
+                return jsonify({
+                    "error": "No calendar-confirmed free slots are available tomorrow; no call was placed. "
+                             "Offer the lead an alternative day or book manually.",
+                    "status": "no_slots",
+                }), 502
+        # Preview mode (live disabled) skips the lookup entirely: the result is
+        # simulated and nothing is dialed or booked.
 
         # Step 1: Place outbound CALL-E call with structured result extraction
         call_result = place_call_e_call(
@@ -1553,7 +1573,7 @@ def booking_decision(status, structured, simulated=False):
 def call_status(call_id):
     """Poll the CALL-E call and, when done, schedule the appointment at the lead's preferred time."""
     try:
-        auth_err = require_token()
+        auth_err = require_token(strict=True)
         if auth_err:
             return auth_err
 
@@ -1752,14 +1772,24 @@ def read_batch_rows(file_storage):
 
 
 def process_batch(batch_id):
-    """Background worker: process batch rows sequentially."""
+    """Background worker: process batch rows sequentially.
+
+    Fail-closed rules:
+      - Live mode dials only when the calendar lookup succeeds and at least
+        one calendar-confirmed slot is free; lookup failure or an empty slot
+        list marks the row 'error' and no call is placed for that recipient.
+      - An ambiguous provider outcome (status-fetch error or polling timeout)
+        STOPS the batch: no further recipients are called, and the remaining
+        rows are marked 'stopped'.
+    """
     job = batch_jobs[batch_id]
+    stopped = False
     for row in job["rows"]:
         # Rows rejected at upload (e.g. invalid phone) are already terminal.
         if row.get("_invalid") or row.get("status") in ("error", "stopped", "simulated"):
             job["done_count"] += 1
             continue
-        if job.get("stop"):
+        if job.get("stop") or stopped:
             row["status"] = "stopped"
             job["done_count"] += 1
             continue
@@ -1767,20 +1797,27 @@ def process_batch(batch_id):
         row["status"] = "calling"
         try:
             # Pre-compute tomorrow's free slots for this lead so the agent
-            # can offer only available times.
+            # can offer only available times. Live mode fails closed before
+            # dialing when the lookup fails or nothing is free.
             slots = None
-            try:
+            if LIVE_CALLS_ENABLED:
                 creds = get_google_credentials(session_id=job.get("session_id"))
-                if creds:
-                    service = build("calendar", "v3", credentials=creds)
-                    tomorrow = (datetime.utcnow() + timedelta(days=1)).date()
-                    slots = get_available_slots(
-                        service, tomorrow,
-                        row.get("company_tz") or "UTC", row.get("lead_tz") or None,
-                    )
-            except Exception as e:
-                print(f"Batch slot computation failed: {e}")
-                slots = None
+                if not creds:
+                    row["status"] = "error"
+                    row["error"] = "Google Calendar is not connected; no call placed for this recipient."
+                    job["done_count"] += 1
+                    continue
+                service = build("calendar", "v3", credentials=creds)
+                tomorrow = (datetime.utcnow() + timedelta(days=1)).date()
+                slots = get_available_slots(
+                    service, tomorrow,
+                    row.get("company_tz") or "UTC", row.get("lead_tz") or None,
+                )
+                if not slots:
+                    row["status"] = "error"
+                    row["error"] = "No calendar-confirmed free slots are available tomorrow; no call placed for this recipient."
+                    job["done_count"] += 1
+                    continue
 
             call_result = place_call_e_call(
                 to_number=row["phone"],
@@ -1802,6 +1839,7 @@ def process_batch(batch_id):
 
             # Poll until terminal state (up to ~10 min)
             terminal = False
+            ambiguous = False
             status = None
             structured = {}
             for _ in range(40):
@@ -1826,17 +1864,30 @@ def process_batch(batch_id):
                 except Exception as e:
                     row["status"] = "error"
                     row["error"] = f"Call status lookup failed: {e}"
+                    ambiguous = True
                     terminal = True
                     break
 
             if job.get("stop"):
                 row["status"] = "stopped"
-            elif terminal and row.get("status") == "error":
-                # A status-fetch failure was recorded; nothing further happens.
-                pass
+            elif ambiguous:
+                # An ambiguous provider outcome stops the batch: a call may
+                # still be in flight, so no further recipients are dialed.
+                job["status"] = "stopped"
+                job["stopped_reason"] = (
+                    f"Batch stopped: call status lookup failed for {mask_phone(row['phone'])} "
+                    f"({row['error']}); no further calls were placed."
+                )
+                stopped = True
             elif not terminal:
                 row["status"] = "error"
                 row["error"] = "Call status unknown (polling timed out); no booking attempted."
+                job["status"] = "stopped"
+                job["stopped_reason"] = (
+                    "Batch stopped: polling timed out while awaiting a terminal call status; "
+                    "no further calls were placed."
+                )
+                stopped = True
             elif terminal and status == "completed":
                 decision = booking_decision(status, structured, simulated=bool(row.get("simulated")))
                 if decision is not None:
@@ -1891,7 +1942,7 @@ def process_batch(batch_id):
 def batch_upload():
     """Upload an Excel/CSV file and process leads sequentially."""
     try:
-        auth_err = require_token()
+        auth_err = require_token(strict=True)
         if auth_err:
             return auth_err
 
@@ -1949,7 +2000,7 @@ def batch_upload():
 @app.route("/batch-status/<batch_id>")
 def batch_status(batch_id):
     """Return current progress of a batch job (phone numbers masked)."""
-    auth_err = require_token()
+    auth_err = require_token(strict=True)
     if auth_err:
         return auth_err
     job = batch_jobs.get(batch_id)
@@ -1961,6 +2012,8 @@ def batch_status(batch_id):
         "total": job["total"],
         "done_count": job["done_count"],
         "running": job["running"],
+        "status": job.get("status", "running"),
+        "stopped_reason": job.get("stopped_reason"),
         "rows": [
             {
                 "name": r["name"],
@@ -1986,7 +2039,7 @@ def batch_status(batch_id):
 @app.route("/batch-stop/<batch_id>", methods=["POST"])
 def batch_stop(batch_id):
     """Stop a running batch after the current call completes."""
-    auth_err = require_token()
+    auth_err = require_token(strict=True)
     if auth_err:
         return auth_err
     job = batch_jobs.get(batch_id)
@@ -2002,7 +2055,7 @@ def batch_download(batch_id):
 
     Phone numbers are masked in the exported file for privacy.
     """
-    auth_err = require_token()
+    auth_err = require_token(strict=True)
     if auth_err:
         return auth_err
     job = batch_jobs.get(batch_id)
@@ -2093,7 +2146,7 @@ def oauth2callback():
 @app.route("/detect-timezone")
 def detect_timezone():
     """Return the timezone derived from a valid E.164 phone number."""
-    auth_err = require_token()
+    auth_err = require_token(strict=True)
     if auth_err:
         return auth_err
     phone = request.args.get("phone", "")
@@ -2111,7 +2164,7 @@ def detect_timezone():
 @app.route("/oauth-status")
 def oauth_status():
     """Return whether Google is connected and with which account/scopes (account masked)."""
-    auth_err = require_token()
+    auth_err = require_token(strict=True)
     if auth_err:
         return auth_err
 
@@ -2143,7 +2196,7 @@ def oauth_status():
 @app.route("/oauth-disconnect", methods=["POST"])
 def oauth_disconnect():
     """Revoke the calling session's Google credentials so the user can reconnect."""
-    auth_err = require_token()
+    auth_err = require_token(strict=True)
     if auth_err:
         return auth_err
     try:
@@ -2161,7 +2214,7 @@ def oauth_disconnect():
 @app.route("/oauth")
 def oauth_start():
     """Start Google OAuth flow with state validation and PKCE."""
-    auth_err = require_token()
+    auth_err = require_token(strict=True)
     if auth_err:
         return auth_err
     try:
@@ -2238,7 +2291,8 @@ if __name__ == "__main__":
         print("PREVIEW MODE: live calls are DISABLED (CALLE_LIVE_CALLS_ENABLED unset).")
         print("All call results are simulated; nothing is dialed or booked.")
         if not APP_TOKEN:
-            print("No APP_TOKEN configured: routes run unauthenticated because no live side effect is possible.")
+            print("No APP_TOKEN configured: only lead submission runs unauthenticated.")
+            print("Call-status, OAuth, batch, and data routes still require authentication.")
         else:
             print("APP_TOKEN is configured and enforced on all private routes.")
     else:
